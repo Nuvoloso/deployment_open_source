@@ -1,0 +1,571 @@
+{# Copyright 2019 Tad Lebeck
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License. -#}
+{%- set managementNamespace = "nuvoloso-management" -%}
+{#- Avoid nuvoloso- prefix for storage class names to ensure no conflict with SPA storage classes -#}
+{%- set configDbStorageClass = "nuvolosomgmt-configdb" -%}
+{%- set metricsDbStorageClass = "nuvolosomgmt-metricsdb" -%}
+{%- if not internal or cspType == "Azure" %}
+{%- set useImagePullSecret = true %}
+{%- set imagePullSecretMountPoint = "/etc/nuvoloso/image-pull-secret" %}
+{%- endif -%}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{managementNamespace}}
+{%- if useImagePullSecret %}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{imagePullSecretName}}
+  namespace: {{managementNamespace}}
+data:
+{%- if not internal %}
+  # Replace the value of .dockerconfigjson with the encoded authentication information of a DockerHub
+  # account that has download access to the containers in the Nuvoloso DockerHub repository.
+  # Refer to https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+  # for details on how to construct this value.
+  .dockerconfigjson: eyJhdXRocyI6eyJodHRwczovL2luZGV4LmRvY2tlci5pby92MS8iOnsiYXV0aCI6IkludmFsaWREb2NrZXJIdWJBdXRoVG9rZW4ifX19Cg==
+{%- else %}
+  # Use the appropriate service principal for the nuvoloso.azurecr.io repository
+  .dockerconfigjson: "eyJhdXRocyI6eyJudXZvbG9zby5henVyZWNyLmlvIjp7InVzZXJuYW1lIjoiMTFjZjAyMGUtNDBjNy00ZjAyLThmMTAtZmY1OWVjN2ZhMWJiIiwicGFzc3dvcmQiOiIzMzYxOTQwMS1lMzFmLTQ4ODUtYjQ5Zi1jMGUxMzY2ZjlkYmUiLCJlbWFpbCI6Im5vYm9keUBudXZvbG9zby5jb20iLCJhdXRoIjoiTVRGalpqQXlNR1V0TkRCak55MDBaakF5TFRobU1UQXRabVkxT1dWak4yWmhNV0ppT2pNek5qRTVOREF4TFdVek1XWXRORGc0TlMxaU5EbG1MV013WlRFek5qWm1PV1JpWlE9PSJ9fX0="
+{%- endif %}{# not internal #}
+type: kubernetes.io/dockerconfigjson
+{%- endif %}{# useImagePullSecret #}
+---
+apiVersion: v1
+kind: Service
+metadata:
+{%- set nginxService = "nginx" %}
+  name: {{nginxService}}
+  namespace: {{managementNamespace}}
+  labels:
+    app: nginx
+spec:
+  clusterIP: None
+  ports:
+  - port: 443
+    name: nginx-https
+  selector:
+    app: nuvoloso
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nuvo-https
+  namespace: {{managementNamespace}}
+  labels:
+    app: nuvoloso
+spec:
+  externalTrafficPolicy: Local
+  ports:
+  - port: 443
+    protocol: TCP
+    targetPort: 443
+  selector:
+    app: nuvoloso
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+{%- set clusterDNSName = "cluster.local" %}
+{%- set configDbService = "configdb" %}
+{%- set configDbStatefulSet = "configdb" %}
+{%- set configDbReplSet = "nuvoloso-configdb" %}
+{%- set configDbServiceDNSName = configDbService+"."+managementNamespace+".svc."+clusterDNSName %}
+{%- if configDbReplicas == 1 %}
+  {%- set configDbURL = "mongodb://{0}-0.{1}/?replicaSet={2}".format(configDbStatefulSet, configDbServiceDNSName, configDbReplSet) %}
+{%- else %}
+  {%- set configDbURL = "mongodb://{0}-0.{1},{0}-1.{1},{0}-2.{1}/?replicaSet={2}".format(configDbStatefulSet, configDbServiceDNSName, configDbReplSet) %}
+{%- endif %}
+  name: {{configDbService}}
+  namespace: {{managementNamespace}}
+  labels:
+    app: configdb
+spec:
+  clusterIP: None
+  ports:
+  - port: 27017
+    name: configdb-port
+  selector:
+    app: nuvoloso-configdb
+---
+apiVersion: v1
+kind: Service
+metadata:
+{%- set metricsDbService = "metricsdb" %}
+  name: {{metricsDbService}}
+  namespace: {{managementNamespace}}
+  labels:
+    app: metricsdb
+spec:
+  clusterIP: None
+  ports:
+  - port: 5432
+    name: metricsdb-port
+  selector:
+    app: nuvoloso-metricsdb
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nuvoloso-management-account
+  namespace: {{managementNamespace}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nuvoloso-management-clusterrole
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nuvoloso-management-clusterrolebinding
+roleRef:
+  kind: ClusterRole
+  name: nuvoloso-management-clusterrole
+  apiGroup: rbac.authorization.k8s.io
+subjects:
+  - kind: ServiceAccount
+    name: nuvoloso-management-account
+    namespace: {{managementNamespace}}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: services
+  namespace: {{managementNamespace}}
+spec:
+  replicas: 1 # do not change, not designed for multiple replicas
+  selector:
+    matchLabels:
+      app: nuvoloso
+  serviceName: {{nginxService}}
+  template:
+    metadata:
+      labels:
+        app: nuvoloso
+    spec:
+      containers:
+        - name: nginx
+          image: {{imagePath}}/nginx:{{imageTag}}
+          imagePullPolicy: Always
+          ports:
+          - containerPort: 80
+          - containerPort: 443
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "nginx -s quit; while killall -0 nginx; do sleep 1; done"]
+          volumeMounts:
+          - name: tls
+            mountPath: /etc/nuvoloso/tls
+            readOnly: true
+        - name: centrald
+          image: {{imagePath}}/nvcentrald:{{imageTag}}
+          imagePullPolicy: Always
+          args:
+          - --agentd-cert=/etc/nuvoloso/tls/agentdCert
+          - --agentd-key=/etc/nuvoloso/tls/agentdKey
+          - --audit.host={{metricsDbService}}
+          - --audit.ssl
+          - --audit.ssl-server-name=metricsdb.nuvoloso.com
+          - --auth.ssl
+          - --auth.ssl-server-name=auth.nuvoloso.com
+          - --cluster-deploy-tag={{imageTag}}
+          - --clusterd-cert=/etc/nuvoloso/tls/clusterdCert
+          - --clusterd-key=/etc/nuvoloso/tls/clusterdKey
+          - "--image-path={{imagePath}}"
+{%- if useImagePullSecret %}
+          - "--image-pull-secret={{imagePullSecretMountPoint}}/.dockerconfigjson"
+{%- endif %}
+          - --metrics.host={{metricsDbService}}
+          - --metrics.ssl
+          - --metrics.ssl-server-name=metricsdb.nuvoloso.com
+          - --mongo.url={{configDbURL}}
+          - --mongo.ssl
+          - --tls-ca=/etc/nuvoloso/tls/caCert
+          - --tls-certificate=/etc/nuvoloso/tls/centraldCert
+          - --tls-key=/etc/nuvoloso/tls/centraldKey
+{%- if enableREI %}
+          - --debug-permit-rei
+          - --sreq.debug-permit-rei
+          - --vreq.debug-permit-rei
+{%- endif %}
+          env:
+          - name: NUVO_POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: NUVO_POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          ports:
+          - containerPort: 8080
+          - containerPort: 8443
+          volumeMounts:
+{%- if useImagePullSecret %}
+          - name: image-pull-secret
+            mountPath: "{{imagePullSecretMountPoint}}"
+            readOnly: true
+{%- endif %}
+          - name: tls
+            mountPath: /etc/nuvoloso/tls
+            readOnly: true
+        - name: auth
+          image: {{imagePath}}/nvauth:{{imageTag}}
+          imagePullPolicy: Always
+          args:
+          - --scheme=https
+          - --tls-ca=/etc/nuvoloso/tls/caCert
+          - --tls-certificate=/etc/nuvoloso/tls/authCert
+          - --tls-key=/etc/nuvoloso/tls/authKey
+          - --mongo.url={{configDbURL}}
+          - --mongo.ssl
+          ports:
+          - containerPort: 5555
+          volumeMounts:
+          - name: tls
+            mountPath: /etc/nuvoloso/tls
+            readOnly: true
+        - name: webservice
+          image: {{imagePath}}/webservice:{{imageTag}}
+          imagePullPolicy: Always
+          env:
+          - name: API_PORT
+            value: "8443"
+          - name: AUTH_URL
+            value: "https://localhost:5555/auth/"
+          - name: CA_CRT
+            value: /etc/nuvoloso/tls/caCert
+          - name: CLIENT_CRT
+            value: /etc/nuvoloso/tls/webserviceCert
+          - name: CLIENT_KEY
+            value: /etc/nuvoloso/tls/webserviceKey
+          - name: METRICSDB_HOST
+            value: "{{metricsDbService}}"
+          - name: METRICSDB_USE_SSL
+            value: "enable" # any non-empty value will enable SSL
+          - name: SERVER_CRT
+            value: /etc/nuvoloso/tls/webserviceCert
+          - name: SERVER_KEY
+            value: /etc/nuvoloso/tls/webserviceKey
+          ports:
+          - containerPort: 8000
+          volumeMounts:
+          - name: tls
+            mountPath: /etc/nuvoloso/tls
+            readOnly: true
+{%- if useImagePullSecret %}
+      imagePullSecrets:
+      - name: {{imagePullSecretName}}
+{%- endif %}
+      serviceAccountName: nuvoloso-management-account
+      volumes:
+{%- if useImagePullSecret %}
+      # pass the secret on so that it can be used in the generated cluster deployment yaml
+      - name: image-pull-secret
+        secret:
+          secretName: {{imagePullSecretName}}
+{%- endif %}
+      - name: tls
+        secret:
+          secretName: nuvoloso-tls
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{configDbStatefulSet}}
+  namespace: {{managementNamespace}}
+spec:
+  replicas: {{configDbReplicas}} # only 1 or 3 replicas are supported
+  selector:
+    matchLabels:
+      app: nuvoloso-configdb
+  serviceName: {{configDbService}}
+  template:
+    metadata:
+      labels:
+        app: nuvoloso-configdb
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: "app"
+                    operator: In
+                    values:
+                    - nuvoloso-configdb
+              topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: mongo
+          image: {{imagePath}}/configdb:{{imageTag}}
+          imagePullPolicy: Always
+          args:
+          - --replSet
+          - {{configDbReplSet}}
+          - --sslMode
+          - requireSSL
+          - --sslPEMKeyFile
+          - /configDbPEM
+          - --sslCAFile
+          - /etc/nuvoloso/tls/caCert
+          - --sslDisabledProtocols
+          - "TLS1_0,TLS1_1"
+          # - --sslAllowInvalidHostnames # add this if the cert lacks subjectAltName listing all replicas full DNS names (untested)
+          env:
+          - name: CONFIGDB_CRT
+            value: /etc/nuvoloso/tls/configDbCert
+          - name: CONFIGDB_KEY
+            value: /etc/nuvoloso/tls/configDbKey
+          - name: CONFIGDB_PEM
+            value: /configDbPEM
+          ports:
+          - containerPort: 27017
+          volumeMounts:
+          - name: configdbstorage
+            mountPath: /data/db
+            # subPath is specified to be consistent with metricsdbstorage volume below
+            subPath: configdb
+          - name: tls
+            mountPath: /etc/nuvoloso/tls
+            readOnly: true
+        - name: mongo-sidecar
+          image: {{imagePath}}/nv-mongo-sidecar:{{imageTag}}
+          imagePullPolicy: Always
+          args:
+          - --ca-cert=/etc/nuvoloso/tls/caCert
+          - --client-cert=/etc/nuvoloso/tls/mongoSidecarCert
+          - --client-key=/etc/nuvoloso/tls/mongoSidecarKey
+          - --mongo.url=mongodb://{{configDbStatefulSet}}-0.{{configDbServiceDNSName}} # not the replica set URL, this is used to bootstrap the replica set
+          - --mongo.max-pool-size=4
+          - --mongo.ssl
+          env:
+          - name: MONGODB_RS_NAME
+            value: {{configDbReplSet}}
+          - name: NUVO_POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: NUVO_POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: NUVO_POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: NUVO_POD_UID
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.uid
+          - name: NUVO_NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+          volumeMounts:
+          - name: tls
+            mountPath: /etc/nuvoloso/tls
+            readOnly: true
+{%- if useImagePullSecret %}
+      imagePullSecrets:
+      - name: {{imagePullSecretName}}
+{%- endif %}
+      serviceAccountName: nuvoloso-management-account
+      volumes:
+      - name: tls
+        secret:
+          secretName: nuvoloso-tls
+  volumeClaimTemplates:
+  - metadata:
+      name: configdbstorage
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 3Gi
+      storageClassName: {{configDbStorageClass}}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: metricsdb
+  namespace: {{managementNamespace}}
+spec:
+  replicas: 1 # do not change, not set up for multiple replicas
+  selector:
+    matchLabels:
+      app: nuvoloso-metricsdb
+  serviceName: {{metricsDbService}}
+  template:
+    metadata:
+      labels:
+        app: nuvoloso-metricsdb
+    spec:
+      containers:
+        - name: db
+          image: {{imagePath}}/metricsdb:{{imageTag}}
+          imagePullPolicy: Always
+          args:
+          - -c
+          - ssl=on
+          - -c
+          - ssl_cert_file=/etc/nuvoloso/tls/metricsDbCert
+          - -c
+          - ssl_key_file=/etc/nuvoloso/tls/metricsDbKey
+          - -c
+          - ssl_ca_file=/etc/nuvoloso/tls/caCert
+          - -c
+          - hba_file=/etc/nuvoloso/pg_hba.conf
+          ports:
+          - containerPort: 5432
+          lifecycle:
+            preStop:
+              exec:
+                # try to get metricsdb to exit gracefully and cleanly
+                command: ["/bin/sh", "-c", "PGUSER=postgres su-exec postgres pg_ctl -D /var/lib/postgresql/data -m fast -w stop"]
+          volumeMounts:
+          - name: metricsdbstorage
+            mountPath: /var/lib/postgresql/data
+            # subPath is required for "Option 2" below, because postgres does
+            # not like to see a lost+found directory in its "data" directory
+            subPath: metricsdb
+          - name: tls
+            mountPath: /etc/nuvoloso/tls
+            readOnly: true
+{%- if useImagePullSecret %}
+      imagePullSecrets:
+      - name: {{imagePullSecretName}}
+{%- endif %}
+      securityContext:
+        # Specifying fsGroup causes the group of all volumes to use this GID by default instead of 0.
+        # This is needed for the tls volume and is ok for the metricsdbstorage volume.
+        # 70 is the GID of the postgres group within the container.
+        fsGroup: 70
+      volumes:
+      - name: tls
+        secret:
+          secretName: nuvoloso-tls
+          defaultMode: 0640 # satifies postgres key file requirements
+  volumeClaimTemplates:
+  - metadata:
+      name: metricsdbstorage
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 3Gi
+      storageClassName: {{metricsDbStorageClass}}
+---
+{%- if cspType == "AWS" %}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{configDbStorageClass}}
+parameters:
+  type: gp2
+  fsType: xfs
+provisioner: kubernetes.io/aws-ebs
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{metricsDbStorageClass}}
+parameters:
+  type: gp2
+  fsType: ext4
+provisioner: kubernetes.io/aws-ebs
+{%- elif cspType == "Azure" %}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{configDbStorageClass}}
+parameters:
+  fsType: xfs
+  # remaining parameters based on the AKS managed-premium storage class; adjust as needed
+  cachingmode: ReadOnly
+  kind: Managed
+  storageaccounttype: Premium_LRS
+provisioner: kubernetes.io/azure-disk
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{metricsDbStorageClass}}
+parameters:
+  fsType: ext4
+  # remaining parameters based on the AKS managed-premium storage class; adjust as needed
+  cachingmode: ReadOnly
+  kind: Managed
+  storageaccounttype: Premium_LRS
+provisioner: kubernetes.io/azure-disk
+{%- elif cspType == "GCP" %}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{configDbStorageClass}}
+parameters:
+  type: pd-ssd
+  fsType: xfs
+provisioner: kubernetes.io/gce-pd
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{metricsDbStorageClass}}
+parameters:
+  type: pd-ssd
+  fsType: ext4
+provisioner: kubernetes.io/gce-pd
+{%- endif %}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nuvoloso-tls
+  namespace: {{managementNamespace}}
+type: Opaque
+data:
+  # The configDbCert is expected to include subjectAltName extention that includes the full DNS names of all of the replicas
+  caCert: {{caCrt}}
+  agentdCert: {{agentdCrt}}
+  agentdKey: {{agentdKey}}
+  authCert: {{authCrt}}
+  authKey: {{authKey}}
+  centraldCert: {{centraldCrt}}
+  centraldKey: {{centraldKey}}
+  clusterdCert: {{clusterdCrt}}
+  clusterdKey: {{clusterdKey}}
+  configDbCert: {{configdbRSCrt}}
+  configDbKey: {{configdbRSKey}}
+  metricsDbCert: {{metricsdbCrt}}
+  metricsDbKey: {{metricsdbKey}}
+  mongoSidecarCert: {{mongosidecarCrt}}
+  mongoSidecarKey: {{mongosidecarKey}}
+  nginxCert: {{nginxCrt}}
+  nginxKey: {{nginxKey}}
+  webserviceCert: {{webserviceCrt}}
+  webserviceKey: {{webserviceKey}}
